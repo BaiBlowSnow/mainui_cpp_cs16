@@ -12,6 +12,8 @@ but WITHOUT ANY WARRANTY; without even the implied warranty of
 MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 GNU General Public License for more details.
 */
+#undef BigFloat
+#include "menu_int.h"
 #include "BaseFontBackend.h"
 #include "FontManager.h"
 #include <math.h>
@@ -513,6 +515,94 @@ int CBaseFont::DrawCharacter(int ch, Point pt, int charH, const unsigned int col
 	CBaseFont::glyph_t find( ch );
 	int idx = m_glyphs.Find( find );
 
+	// 如果字符不在缓存中，动态加载
+	if( !m_glyphs.IsValidIndex( idx ) )
+	{
+		// 打印不支持字符
+		Con_Printf( "不支持字符: %d\n", ch );
+
+		// 检查字体是否支持该字符
+		if( !HasChar( ch ) )
+		{
+#ifdef SCALE_FONTS
+			if( charH > 0 )
+			{
+				return width * factor + 0.5f;
+			}
+			else
+#endif
+			{
+				return width;
+			}
+		}
+
+		// 动态加载单个字符
+		int maxWidth = GetMaxCharWidth();
+		int height = GetHeight();
+		int tempSize = maxWidth * height * 4;
+		Point nullPt( 0, 0 );
+
+		Size tempDrawSize( maxWidth, height );
+		byte *temp = new byte[tempSize];
+		memset( temp, 0, tempSize );
+
+		Size drawSize;
+		GetCharRGBA( ch, nullPt, tempDrawSize, temp, drawSize );
+
+		// 检查是否需要创建新的纹理
+		if( m_szTextureName[0] == 0 )
+		{
+			GetTextureName( m_szTextureName, sizeof( m_szTextureName ) );
+		}
+
+		// 无论纹理是否存在，都创建一个新的纹理来存储单个字符
+		// 这样可以避免修改现有纹理的复杂性
+		char tempTextureName[256];
+		sprintf( tempTextureName, "#%s_%d_char", m_szName, ch );
+
+		// 创建一个新的BMP文件
+		CBMP bmp( MAX_PAGE_SIZE, MAX_PAGE_SIZE );
+		byte *rgbdata = bmp.GetTextureData();
+		bmp_t *hdr = bmp.GetBitmapHdr();
+
+		// 计算字符在纹理中的位置
+		int xstart = 0, ystart = hdr->height - 1;
+
+		// 复制字符到纹理
+		for( int y = 0; y < height - 1; y++ )
+		{
+			byte *dst = &rgbdata[(ystart - y) * hdr->width * 4];
+			byte *src = &temp[y * maxWidth * 4];
+			for( int x = 0; x < drawSize.w; x++ )
+			{
+				byte *xdst = &dst[ ( xstart + x ) * 4 ];
+				byte *xsrc = &src[ x * 4 ];
+				memcpy( xdst, xsrc, 4 );
+			}
+		}
+
+		// 加载纹理到引擎
+		HIMAGE hImage = EngFuncs::PIC_Load( tempTextureName, bmp.GetBitmap(), bmp.GetBitmapHdr()->fileSize, 0 );
+
+		// 保存到缓存
+		SaveToCache( tempTextureName, nullptr, 0, &bmp );
+
+		// 创建新的字形
+		CBaseFont::glyph_t glyph;
+		glyph.ch = ch;
+		glyph.rect.top = 0;
+		glyph.rect.bottom = height;
+		glyph.rect.left = 0;
+		glyph.rect.right = drawSize.w;
+		glyph.texture = hImage;
+
+		// 添加到缓存
+		idx = m_glyphs.Insert( glyph );
+
+		delete[] temp;
+	}
+
+	// 渲染字符
 	if( m_glyphs.IsValidIndex( idx ) )
 	{
 		CBaseFont::glyph_t &glyph = m_glyphs[idx];
@@ -595,8 +685,17 @@ bool CBaseFont::ReadFromCache( const char *filename, charRange_t *range, size_t 
 		return false;
 	}
 
-	for( i = 0; i < rangeSize; i++ )
-		charsCount += range[i].Length();
+	// 计算字符数量
+	if( range && rangeSize > 0 )
+	{
+		for( i = 0; i < rangeSize; i++ )
+			charsCount += range[i].Length();
+	}
+	else
+	{
+		// 对于动态加载的单个字符，直接使用1
+		charsCount = 1;
+	}
 
 	hdr = reinterpret_cast<cached_font_t *>( data );
 
@@ -670,41 +769,66 @@ bool CBaseFont::ReadFromCache( const char *filename, charRange_t *range, size_t 
 
 	ch = reinterpret_cast<char_data_t *>(data + sizeof( cached_font_t ));
 
-	for( i = 0; i < rangeSize; i++ )
+	// 处理字符数据
+	if( range && rangeSize > 0 )
 	{
-		charsCount = range[i].Length();
-
-		for( j = 0; j < charsCount; j++ )
+		for( i = 0; i < rangeSize; i++ )
 		{
-			if( ch->ch != range[i].Character( j ))
-			{
-				Con_Printf( "Font cache file has different character set. Expected %d, got %d", range[i].Character( j ), ch->ch );
-				EngFuncs::COM_FreeFile( data );
-				EngFuncs::PIC_Free( filename );
-				EngFuncs::DeleteFile( filename );
-				return false;
-			}
+			charsCount = range[i].Length();
 
-			glyph_t glyph( ch->ch );
-			abc_t abc;
+			for( j = 0; j < charsCount; j++ )
+				{
+					if( ch->ch != range[i].Character( j ))
+					{
+						Con_Printf( "Font cache file has different character set. Expected %d, got %d", range[i].Character( j ), ch->ch );
+						EngFuncs::COM_FreeFile( data );
+						EngFuncs::PIC_Free( filename );
+						EngFuncs::DeleteFile( filename );
+						return false;
+					}
 
-			glyph.rect.left = ch->left;
-			glyph.rect.bottom = ch->bottom;
-			glyph.rect.right = ch->right;
-			glyph.rect.top = ch->top;
-			glyph.texture = hImage;
+					CBaseFont::glyph_t glyph( ch->ch );
+					CBaseFont::abc_t abc;
 
-			m_glyphs.Insert( glyph );
+					glyph.rect.left = ch->left;
+					glyph.rect.bottom = ch->bottom;
+					glyph.rect.right = ch->right;
+					glyph.rect.top = ch->top;
+					glyph.texture = hImage;
 
-			abc.ch = ch->ch;
-			abc.a = ch->a;
-			abc.b = ch->b;
-			abc.c = ch->c;
+					m_glyphs.Insert( glyph );
 
-			m_ABCCache.Insert( abc );
+					abc.ch = ch->ch;
+					abc.a = ch->a;
+					abc.b = ch->b;
+					abc.c = ch->c;
 
-			ch++;
+					m_ABCCache.Insert( abc );
+
+					ch++;
+				}
 		}
+	}
+	else
+	{
+		// 对于动态加载的单个字符，直接读取第一个字符
+		CBaseFont::glyph_t glyph( ch->ch );
+		CBaseFont::abc_t abc;
+
+		glyph.rect.left = ch->left;
+		glyph.rect.bottom = ch->bottom;
+		glyph.rect.right = ch->right;
+		glyph.rect.top = ch->top;
+		glyph.texture = hImage;
+
+		m_glyphs.Insert( glyph );
+
+		abc.ch = ch->ch;
+		abc.a = ch->a;
+		abc.b = ch->b;
+		abc.c = ch->c;
+
+		m_ABCCache.Insert( abc );
 	}
 
 	EngFuncs::COM_FreeFile( data );
@@ -723,8 +847,17 @@ void CBaseFont::SaveToCache( const char *filename, charRange_t *range, size_t ra
 	if( filename[0] == '#' )
 		filename++;
 
-	for( i = 0; i < rangeSize; i++ )
-		charsCount += range[i].Length();
+	// 计算字符数量
+	if( range && rangeSize > 0 )
+	{
+		for( i = 0; i < rangeSize; i++ )
+			charsCount += range[i].Length();
+	}
+	else
+	{
+		// 对于动态加载的单个字符，直接使用1
+		charsCount = 1;
+	}
 
 	size = sizeof( cached_font_t ) +
 			charsCount * sizeof( char_data_t ) +
@@ -738,31 +871,52 @@ void CBaseFont::SaveToCache( const char *filename, charRange_t *range, size_t ra
 
 	buf_p += sizeof( cached_font_t );
 
-	for( i = 0; i < rangeSize; i++ )
+	// 处理字符数据
+	if( range && rangeSize > 0 )
 	{
-		charsCount = range[i].Length();
-
-		for( j = 0; j < charsCount; j++ )
+		for( i = 0; i < rangeSize; i++ )
 		{
-			char_data_t ch;
+			charsCount = range[i].Length();
+
+			for( j = 0; j < charsCount; j++ )
+				{
+					char_data_t ch;
 
 
-			ch.ch = range[i].Character( j );
-			GetCharABCWidths( ch.ch, ch.a, ch.b, ch.c );
+					ch.ch = range[i].Character( j );
+					GetCharABCWidths( ch.ch, ch.a, ch.b, ch.c );
 
-			glyph_t glyph( ch.ch );
-			int idx = m_glyphs.Find( glyph );
+					CBaseFont::glyph_t glyph( ch.ch );
+					int idx = m_glyphs.Find( glyph );
 
-			glyph = m_glyphs[idx];
+					glyph = m_glyphs[idx];
 
-			ch.left   = glyph.rect.left;
-			ch.right  = glyph.rect.right;
-			ch.bottom = glyph.rect.bottom;
-			ch.top    = glyph.rect.top;
+					ch.left   = glyph.rect.left;
+					ch.right  = glyph.rect.right;
+					ch.bottom = glyph.rect.bottom;
+					ch.top    = glyph.rect.top;
 
-			memcpy( buf_p, &ch, sizeof( ch ));
-			buf_p += sizeof( ch );
+					memcpy( buf_p, &ch, sizeof( ch ));
+					buf_p += sizeof( ch );
+				}
 		}
+	}
+	else
+	{
+		// 对于动态加载的单个字符，使用最后添加的字形
+		char_data_t ch;
+		CBaseFont::glyph_t glyph = m_glyphs[m_glyphs.Count() - 1];
+
+		ch.ch = glyph.ch;
+		GetCharABCWidths( ch.ch, ch.a, ch.b, ch.c );
+
+		ch.left   = glyph.rect.left;
+		ch.right  = glyph.rect.right;
+		ch.bottom = glyph.rect.bottom;
+		ch.top    = glyph.rect.top;
+
+		memcpy( buf_p, &ch, sizeof( ch ));
+		buf_p += sizeof( ch );
 	}
 
 	memcpy( buf_p, bmp->GetBitmapHdr(), bmpSize );
